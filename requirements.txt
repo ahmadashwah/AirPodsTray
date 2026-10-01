@@ -1,0 +1,7 @@
+bleak>=0.22
+pystray
+pillow
+winrt-Windows.Media.Control==3.2.1
+
+# only needed to build the .exe
+pyinstaller
