@@ -18,6 +18,7 @@ import ctypes.wintypes as w
 import re
 import time
 import uuid
+import winreg
 
 from bleak import BleakScanner
 from winrt.windows.devices.bluetooth import BluetoothConnectionStatus, BluetoothDevice
@@ -30,6 +31,27 @@ KSPROPERTY_ONESHOT_RECONNECT = 0
 KSPROPERTY_ONESHOT_DISCONNECT = 1
 IOCTL_KS_PROPERTY = 0x002F0003
 A2DP_UUID = "0000110b-0000-1000-8000-00805f9b34fb"
+
+MMDEVICES_RENDER = r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render"
+PKEY_DEVICE_INTERFACE_NAME = "{b3f8fa53-0004-438e-9003-51a46e139bfc},6"
+DEVICE_STATE_ACTIVE = 1  # 8 = unplugged
+
+
+def audio_endpoint_state(device_name: str) -> int | None:
+    """DeviceState of the stereo ("Headphones") output named after the Bluetooth device.
+    The hands-free endpoint is named "<device> Hands-Free", so an exact name match skips it."""
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, MMDEVICES_RENDER) as endpoints:
+        for i in range(winreg.QueryInfoKey(endpoints)[0]):
+            key = winreg.EnumKey(endpoints, i)
+            try:
+                with winreg.OpenKey(endpoints, key + r"\Properties") as props:
+                    if winreg.QueryValueEx(props, PKEY_DEVICE_INTERFACE_NAME)[0] != device_name:
+                        continue
+                with winreg.OpenKey(endpoints, key) as endpoint:
+                    return winreg.QueryValueEx(endpoint, "DeviceState")[0]
+            except OSError:
+                continue
+    return None
 
 setupapi = ctypes.WinDLL("setupapi", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -100,6 +122,7 @@ class PairedAirPods:
             p = path.lower()
             if A2DP_UUID in p and "vid&0001004c" in p and pid in p:
                 self.ks_path = path
+                self.name: str | None = None  # Bluetooth name, looked up on first use
                 self.mac = int(re.search(r"&([0-9a-f]{12})_c", p).group(1), 16)
                 found_pid = int(re.search(r"pid&([0-9a-f]{4})", p).group(1), 16)
                 self.model_id = ((found_pid & 0xFF) << 8) | (found_pid >> 8)  # back to BLE byte order
@@ -107,8 +130,21 @@ class PairedAirPods:
         raise RuntimeError("No paired AirPods found - pair them in Windows Bluetooth settings first.")
 
     async def is_connected(self) -> bool:
-        device = await BluetoothDevice.from_bluetooth_address_async(self.mac)
-        return device is not None and device.connection_status == BluetoothConnectionStatus.CONNECTED
+        """True when the AirPods are this PC's audio output.
+
+        The Bluetooth link itself (BluetoothDevice.connection_status) often stays up after the
+        audio disconnects, so instead check the "Headphones" audio endpoint Windows keeps for them.
+        """
+        if self.name is None:
+            device = await BluetoothDevice.from_bluetooth_address_async(self.mac)
+            if device is None:
+                return False
+            self.name = device.name
+        state = audio_endpoint_state(self.name)
+        if state is None:  # no endpoint found - fall back to the Bluetooth link
+            device = await BluetoothDevice.from_bluetooth_address_async(self.mac)
+            return device is not None and device.connection_status == BluetoothConnectionStatus.CONNECTED
+        return state == DEVICE_STATE_ACTIVE
 
     def _oneshot(self, prop_id: int) -> None:
         handle = kernel32.CreateFileW(self.ks_path, 0xC0000000, 3, None, 3, 0, None)  # RW, share RW, OPEN_EXISTING
@@ -129,7 +165,7 @@ class PairedAirPods:
         while time.monotonic() < deadline:
             if await self.is_connected():
                 return True
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.1)
         return False
 
     def disconnect(self) -> None:

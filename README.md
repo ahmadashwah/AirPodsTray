@@ -3,12 +3,14 @@
 A small Windows tray app that brings iPhone-style AirPods features to the PC — similar to MagicPods.
 
 - **Battery** for the left bud, right bud and case (tray tooltip, menu and pop-up)
-- **Pop-up** in the corner when you open the case near the PC, with a **Connect** button
-- **Auto-connect** when the case opens (optional)
-- **Auto-pause** when you take a bud out, resume when it goes back in
+- **Pop-up** in the corner when you open the case near the PC, with a **Connect** / **Disconnect** button
+- **Auto-connect** when the case opens or a bud goes in (optional, off by default)
+- **Disconnect when both buds come out**, so audio goes back to the PC speakers straight away
+- **Auto-pause** when you take a bud out, resume when it goes back in — including media the AirPods paused themselves
 - **Pause on disconnect** so videos don't carry on through the PC speakers
 - **Low-battery** notifications
 - **Start with Windows** (optional)
+- **Self-healing**: restarts the Bluetooth scan (or the whole app) if Windows stops it, e.g. after sleep
 
 Tested with AirPods Pro 3 on Windows 11. Other AirPods models should work for battery and in-ear detection; model names are listed in `airpods_scanner.py`.
 
@@ -28,6 +30,8 @@ python airpods_tray.py
 ```
 
 Right-click the tray icon for battery, Connect / Disconnect and settings. Settings are stored in `%APPDATA%\AirPodsTray\settings.json`.
+
+The app keeps a log of what it sees and does (bud changes, every raw AirPods broadcast change, play/pause, connects): next to the .exe as `AirPodsTray.log`, or in `%APPDATA%\AirPodsTray\log.txt` when run from source.
 
 ## Build the .exe
 
@@ -61,14 +65,19 @@ The result is `dist\AirPodsTray.exe`.
 
 Battery nibbles (0–10 → 0–100 %) are relative to the sending bud; the lid byte's low 3 bits count lid openings. AirPods rotate their Bluetooth address when the lid opens, so a new address showing the case battery is treated as "lid opened".
 
+The app scans **passively** (it only needs the advertisement, not a scan response); while audio was streaming, Windows delivered about 3× more AirPods advertisements that way.
+
 **Connecting** uses the Windows Bluetooth audio driver's own one-shot reconnect property (`KSPROPSETID_BtAudio` / `KSPROPERTY_ONESHOT_RECONNECT`) — the same thing the *Connect* button in Windows settings does.
+
+**"Connected"** means the AirPods are the audio output: the app reads the `DeviceState` of their *Headphones* audio endpoint (`HKLM\...\MMDevices\Audio\Render`). The Bluetooth link's own status is not used, because the link often stays up after the audio has disconnected.
 
 **Media control** uses the Windows global media transport controls, so it works with browsers, Spotify and anything else that shows in the Windows media flyout.
 
 ## Limitations
 
-- The advertisements don't say *whose* AirPods they are. The app filters by model and signal strength, but someone else's identical AirPods right next to your PC could confuse it. Telling them apart needs the encryption key, which is only available over Apple's private AAP protocol.
-- Noise-control switching, exact 1 % battery and other AAP features aren't implemented — Windows has no public API for the L2CAP channel AAP uses.
+- **Left-bud ear detection is unreliable.** While worn, usually only one bud broadcasts, and in testing the AirPods often didn't update their advertisement when the other bud came out. The AirPods' own pause/resume sometimes covers it.
+- The advertisements don't say *whose* AirPods they are. The app locks onto the strongest signal of your model and ignores clearly weaker ones, but someone else's identical AirPods right next to your PC could still confuse it. Telling them apart needs the encryption key, which is only available over Apple's private AAP protocol.
+- Noise-control switching, exact 1 % battery and reliable ear detection need AAP, which runs over an L2CAP channel. Windows only lets kernel-mode profile drivers open L2CAP channels, so this would need a driver (like MagicPods' MagicAAP, which requires Test Mode) — not implemented.
 
 ## Disclaimer
 

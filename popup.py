@@ -65,11 +65,11 @@ class FlatButton(tk.Label):
 
 
 class Popup(tk.Toplevel):
-    def __init__(self, root, title: str, on_connect, on_close):
+    def __init__(self, root, title: str, on_connect, on_close, on_disconnect=None):
         super().__init__(root, bg=BG)
+        self.on_connect, self.on_disconnect = on_connect, on_disconnect
         self.overrideredirect(True)
         self.attributes("-topmost", True)
-        self.attributes("-alpha", 0.97)
 
         header = tk.Frame(self, bg=BG)
         header.pack(fill="x", padx=20, pady=(16, 0))
@@ -91,10 +91,9 @@ class Popup(tk.Toplevel):
 
         buttons = tk.Frame(self, bg=BG)
         buttons.pack(pady=(4, 16))
+        # One action button (Connect / Disconnect); the ✕ in the corner closes the pop-up.
         self.connect_button = FlatButton(buttons, "Connect", BLUE, on_connect)
-        self.connect_button.pack(side="left", padx=6)
-        self.dismiss_button = FlatButton(buttons, "Not now", BUTTON_GREY, on_close)
-        self.dismiss_button.pack(side="left", padx=6)
+        self.connect_button.pack()
 
         # Size to the content (so display scaling can't clip it) and sit above the taskbar.
         self.update_idletasks()
@@ -110,14 +109,18 @@ class Popup(tk.Toplevel):
         self.right.show(s.right, s.right_charging)
         self.case.show(s.case, s.case_charging)
 
-    def show_connection(self, text: str, can_connect: bool, done: bool = False) -> None:
+    def show_connection(self, text: str, can_connect: bool, done: bool = False,
+                        can_disconnect: bool = True) -> None:
+        """done=True means connected: the left button becomes Disconnect (if supported)."""
         self.status.config(text=text)
-        if done:
+        if done and self.on_disconnect:
+            self.connect_button.config(text="Disconnect", bg=BUTTON_GREY)
+            self.connect_button.command, self.connect_button.enabled = self.on_disconnect, can_disconnect
+        elif done:
             self.connect_button.pack_forget()
-            self.dismiss_button.config(text="Done", bg=BLUE)
         else:
-            self.connect_button.config(bg=BLUE if can_connect else BUTTON_GREY)
-            self.connect_button.enabled = can_connect
+            self.connect_button.config(text="Connect", bg=BLUE if can_connect else BUTTON_GREY)
+            self.connect_button.command, self.connect_button.enabled = self.on_connect, can_connect
 
 
 class App:

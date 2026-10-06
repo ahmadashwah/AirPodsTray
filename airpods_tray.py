@@ -33,6 +33,7 @@ import asyncio
 import dataclasses
 import json
 import os
+import subprocess
 import time
 import tkinter as tk
 import winreg
@@ -40,8 +41,8 @@ from pathlib import Path
 
 import pystray
 from bleak import BleakScanner
+from bleak.backends.winrt.util import allow_sta
 from PIL import Image, ImageDraw
-from winrt.windows.devices.bluetooth import BluetoothConnectionStatus, BluetoothDevice
 from winrt.windows.media.control import (
     GlobalSystemMediaTransportControlsSessionManager as MediaManager,
     GlobalSystemMediaTransportControlsSessionPlaybackStatus as PlaybackStatus,
@@ -54,18 +55,37 @@ from popup import AUTO_HIDE_SECONDS, Popup
 APP_NAME = "AirPodsTray"
 SETTINGS_FILE = Path(os.environ["APPDATA"]) / APP_NAME / "settings.json"
 DEFAULTS = {"show_popup": True, "auto_connect": False, "auto_pause": True, "pause_on_disconnect": True,
-            "min_rssi": -60}
+            "disconnect_on_remove": True, "min_rssi": -60}
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 LID_COOLDOWN = 15     # seconds to ignore further "lid opened" signals (each bud announces it)
-EAR_DEBOUNCE = 1.0    # an in-ear change must hold this long before pausing / resuming
-EAR_RSSI = -70        # ear tracking works from a bit further away than the pop-up
+EAR_DEBOUNCE = 0.1    # an in-ear change must hold this long before acting on it (each change
+                      # arrives as one clean advert, so this only guards against stray ones)
+EAR_RSSI = -85        # buds in your ears are weak (your head is in the way), so track them from far
 LOW_BATTERY = 20
+OTHER_PAIR_MARGIN = 8       # dB weaker than the strongest same-model AirPods = someone else's
+PAIR_MEMORY = 15            # seconds an address counts as "recently seen" for that comparison
+SCAN_SILENCE_RESTART = 30   # restart the Bluetooth scan if nothing at all is heard for this long
+MAX_SCAN_FAILURES = 5       # failed scan restarts in a row before the app relaunches itself
+HEARTBEAT_SECONDS = 600     # write an "alive" line to the log this often
+# The .exe logs next to itself: AppData is redirected per app package on Windows, so a log there
+# can look different (or stale) depending on which app opens it.
+LOG_FILE = (Path(sys.executable).with_name("AirPodsTray.log") if getattr(sys, "frozen", False)
+            else SETTINGS_FILE.with_name("log.txt"))
 
 
 def log(*parts) -> None:
-    if sys.stdout:  # pythonw has no console
-        print(time.strftime("%X"), *parts, flush=True)
+    line = " ".join([time.strftime("%Y-%m-%d %X"), *map(str, parts)])
+    if sys.stdout:  # pythonw / the .exe have no console
+        print(line, flush=True)
+    try:
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if LOG_FILE.exists() and LOG_FILE.stat().st_size > 1_000_000:
+            LOG_FILE.replace(LOG_FILE.with_suffix(".old.txt"))
+        with LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
 
 
 # ---- settings & start-up ----------------------------------------------------------
@@ -134,18 +154,55 @@ def show_in_taskbar_corner() -> None:
 
 # ---- media control ------------------------------------------------------------------
 
-async def pause_media() -> bool:
-    """Pause whatever is playing. Returns True if something was actually paused."""
-    session = (await MediaManager.request_async()).get_current_session()
-    if session and session.get_playback_info().playback_status == PlaybackStatus.PLAYING:
-        return await session.try_pause_async()
-    return False
+async def pause_media() -> list[str]:
+    """Pause every session that is playing (not just Windows' "current" one, which may be
+    a different app). Returns the ids of the apps that were paused."""
+    paused = []
+    for session in (await MediaManager.request_async()).get_sessions():
+        if session.get_playback_info().playback_status == PlaybackStatus.PLAYING:
+            if await session.try_pause_async():
+                paused.append(session.source_app_user_model_id)
+    log("paused:", paused or "nothing was playing")
+    return paused
 
 
-async def resume_media() -> None:
-    session = (await MediaManager.request_async()).get_current_session()
-    if session:
-        await session.try_play_async()
+async def resume_media(app_ids: list[str]) -> None:
+    """Resume these apps - only if they're still paused (not if the user stopped or switched)."""
+    resumed = []
+    for session in (await MediaManager.request_async()).get_sessions():
+        if (session.source_app_user_model_id in app_ids
+                and session.get_playback_info().playback_status == PlaybackStatus.PAUSED):
+            if await session.try_play_async():
+                resumed.append(session.source_app_user_model_id)
+    log("resumed:", resumed or f"nothing ({app_ids} no longer paused)")
+
+
+class PlayingTracker:
+    """Remembers which apps were playing recently. AirPods send their own "pause" when a bud
+    comes out, which can beat us to it - so "was playing a moment ago" decides what to resume."""
+
+    def __init__(self):
+        self.last_playing: dict[str, float] = {}
+
+    async def run(self) -> None:
+        manager = await MediaManager.request_async()
+        statuses: dict[str, str] = {}
+        while True:
+            now = time.monotonic()
+            for session in manager.get_sessions():
+                app, status = session.source_app_user_model_id, session.get_playback_info().playback_status
+                if status == PlaybackStatus.PLAYING:
+                    self.last_playing[app] = now
+                name = PlaybackStatus(status).name
+                if statuses.get(app) != name:  # log every play/pause, whoever caused it
+                    if app in statuses:
+                        log(f"  media: {app} {statuses[app]} -> {name}")
+                    statuses[app] = name
+            await asyncio.sleep(0.2)
+
+    def playing_within(self, seconds: float) -> list[str]:
+        now = time.monotonic()
+        return [app for app, t in self.last_playing.items() if now - t <= seconds]
 
 
 # ---- tray icon ----------------------------------------------------------------------
@@ -181,6 +238,7 @@ class TrayApp:
         self.connected = False
         self.connecting = False
         self.connect_failed = False
+        self.disconnecting = False
         self.popup: Popup | None = None
         self.popup_shown_at = 0.0
 
@@ -194,7 +252,15 @@ class TrayApp:
         self.ears_pending_since = 0.0
         self.paused_by_us = False
         self.ears_before_pause = 0
+        self.paused_apps: list[str] = []
+        self.playing = PlayingTracker()
+        self.ears_rssi = 0
         self.low_warned: set[str] = set()
+        self._errors_logged: dict[str, float] = {}
+        self._raw_seen: dict[str, tuple] = {}
+        self._signal: dict[str, tuple[float, float]] = {}  # address -> (smoothed dBm, last seen)
+        self.last_advert_at = time.monotonic()
+        self.advert_count = 0
 
         self.icon = pystray.Icon(APP_NAME, make_icon(False), "AirPods - waiting for case", self._menu())
 
@@ -210,9 +276,10 @@ class TrayApp:
         def setting(key):
             return pystray.MenuItem(
                 {"show_popup": "Show pop-up when case opens",
-                 "auto_connect": "Auto-connect when case opens",
+                 "auto_connect": "Auto-connect (case opens or a bud goes in)",
                  "auto_pause": "Pause media when a bud is removed",
-                 "pause_on_disconnect": "Pause media when AirPods disconnect"}[key],
+                 "pause_on_disconnect": "Pause media when AirPods disconnect",
+                 "disconnect_on_remove": "Disconnect when both buds come out"}[key],
                 self._on_loop(self.toggle, key), checked=lambda item: self.settings[key])
 
         return pystray.Menu(
@@ -232,6 +299,7 @@ class TrayApp:
             setting("auto_connect"),
             setting("auto_pause"),
             setting("pause_on_disconnect"),
+            setting("disconnect_on_remove"),
             pystray.MenuItem("Start with Windows", self._on_loop(self.toggle_startup),
                              checked=lambda item: startup_enabled()),
             pystray.Menu.SEPARATOR,
@@ -272,11 +340,24 @@ class TrayApp:
         title = f"{model}\nL {self._fmt('Left')}  R {self._fmt('Right')}  Case {self._fmt('Case')}"[:127]
         signature = (title, self.connected, self.connecting)
         if signature != getattr(self, "_last_signature", None):  # adverts arrive many times a second
-            self._last_signature = signature
-            self.icon.title = title
-            self.icon.icon = make_icon(self.connected)
-            self.icon.update_menu()
-        self._refresh_popup()
+            try:
+                self.icon.title = title
+                self.icon.icon = make_icon(self.connected)
+                self.icon.update_menu()
+                self._last_signature = signature
+            except Exception as e:  # a tray hiccup must never stop scanning or connection tracking
+                self._log_error("tray update failed", e)
+        try:
+            self._refresh_popup()
+        except Exception as e:
+            self._log_error("pop-up update failed", e)
+
+    def _log_error(self, what: str, error: BaseException) -> None:
+        """Log an error, but each distinct error only once a minute (adverts arrive constantly)."""
+        key, now = f"{what}: {error!r}", time.monotonic()
+        if now - self._errors_logged.get(key, -1e9) > 60:
+            self._errors_logged[key] = now
+            log(key)
 
     def _check_low_battery(self) -> None:
         for part in ("Left", "Right", "Case"):
@@ -293,19 +374,53 @@ class TrayApp:
     # ---- Bluetooth adverts ----
 
     def on_advert(self, device, adv) -> None:
+        self.last_advert_at = time.monotonic()
+        self.advert_count += 1
+        try:
+            self._handle_advert(device, adv)
+        except Exception as e:
+            self._log_error("advert handling failed", e)
+
+    def _log_raw_advert(self, address: str, rssi: int, data: bytes, s: AirPodsState, ignored: bool,
+                        other_pair: bool = False) -> None:
+        """Log each change in what a bud broadcasts (status bits + decoded result), to debug ear detection."""
+        where = lambda ear, case: "ear" if ear else "case" if case else "out"
+        key = (data[5], s.left_in_ear, s.right_in_ear, s.left_in_case, s.right_in_case)
+        if self._raw_seen.get(address) == key:
+            return
+        self._raw_seen[address] = key
+        sender = "L" if data[5] & 0x20 else "R"
+        note = ("  (ignored: too far)" if rssi < EAR_RSSI else "  (ignored: no state)" if ignored
+                else "  (ignored: someone else's AirPods)" if other_pair else "")
+        log(f"  advert from {sender} bud {address[-5:]} {rssi} dBm status={data[5]:08b} -> "
+            f"L {where(s.left_in_ear, s.left_in_case)}, R {where(s.right_in_ear, s.right_in_case)}{note}")
+
+    def _is_other_pair(self, address: str, rssi: int) -> bool:
+        """The broadcasts don't say whose AirPods they are, so lock onto the strongest signal of our
+        model (ours sit next to the PC) and ignore addresses clearly weaker than it. Each address keeps
+        a smoothed signal level so one strong or weak reading doesn't flip the choice."""
+        now = time.monotonic()
+        level = self._signal.get(address, (rssi, now))[0]
+        self._signal[address] = (0.7 * level + 0.3 * rssi, now)
+        recent = {a: lvl for a, (lvl, seen) in self._signal.items() if now - seen < PAIR_MEMORY}
+        return self._signal[address][0] < max(recent.values()) - OTHER_PAIR_MARGIN
+
+    def _handle_advert(self, device, adv) -> None:
         data = adv.manufacturer_data.get(APPLE_COMPANY_ID)
         if not data:
             return
         data = bytes(data)
         s = decode(data)
-        if s is None or adv.rssi < EAR_RSSI:
+        if s is None:
             return
         if self.airpods and ((data[3] << 8) | data[4]) != self.airpods.model_id:
             return  # a different AirPods model - not ours
         nothing_known = s.case is None and not (s.left_in_ear or s.right_in_ear
                                                 or s.left_in_case or s.right_in_case)
-        if nothing_known:
-            return  # lid closed / buds in a pocket - also how a neighbour's pair usually looks
+        other_pair = not nothing_known and adv.rssi >= EAR_RSSI and self._is_other_pair(device.address, adv.rssi)
+        self._log_raw_advert(device.address, adv.rssi, data, s, nothing_known, other_pair)
+        if adv.rssi < EAR_RSSI or nothing_known or other_pair:
+            return  # too far / lid closed and buds in a pocket / someone else's AirPods
 
         self.state = s
         for part, value, charging in (("Left", s.left, s.left_charging), ("Right", s.right, s.right_charging),
@@ -313,6 +428,7 @@ class TrayApp:
             if value is not None:
                 self.battery[part] = (value, charging)
         self.ears_seen = int(s.left_in_ear) + int(s.right_in_ear)
+        self.ears_rssi = adv.rssi
 
         # Lid opened: a fresh address with the case open, or a changed lid counter.
         before = self.lid_counters.get(device.address)
@@ -338,21 +454,22 @@ class TrayApp:
     async def _watch_connection(self) -> None:
         if not self.airpods:
             return
-        # Windows tells us the moment the link drops; the 3 s poll is only a fallback.
-        self.bt_device = await BluetoothDevice.from_bluetooth_address_async(self.airpods.mac)
-        if self.bt_device:
-            self.bt_device.add_connection_status_changed(
-                lambda device, _: self.loop.call_soon_threadsafe(
-                    self._set_connected, device.connection_status == BluetoothConnectionStatus.CONNECTED))
+        # "Connected" = the AirPods are the audio output (a cheap registry read), checked every
+        # 0.25 s so a disconnect pauses media quickly. The Bluetooth link's own status/event is
+        # no use here: it often stays up after the audio has gone.
         while not self.quitting:
             if not self.connecting:
-                self._set_connected(await self.airpods.is_connected())
-            await asyncio.sleep(3)
+                try:
+                    self._set_connected(await self.airpods.is_connected())
+                except OSError as e:
+                    log("connection check failed:", e)
+            await asyncio.sleep(0.25)
 
     def _set_connected(self, connected: bool) -> None:
         if connected == self.connected:
             return
         was_connected, self.connected = self.connected, connected
+        self.disconnecting = False
         log("connected" if connected else "disconnected")
         if was_connected and not connected and self.settings["pause_on_disconnect"]:
             # Stop YouTube & co. from carrying on through the PC speakers.
@@ -361,8 +478,8 @@ class TrayApp:
         self._changed()
 
     async def _pause_after_disconnect(self) -> None:
-        if await pause_media():
-            log("paused media (AirPods disconnected)")
+        log("AirPods disconnected - pausing media")
+        await pause_media()
 
     def connect(self) -> None:
         if self.connecting or not self.airpods:
@@ -387,6 +504,9 @@ class TrayApp:
         if self.airpods:
             self.airpods.disconnect()
             log("disconnect sent")
+            if self.connected:
+                self.disconnecting = True
+                self._refresh_popup()
 
     # ---- auto-pause ----
 
@@ -402,8 +522,24 @@ class TrayApp:
         if now - self.ears_pending_since < EAR_DEBOUNCE:
             return
         previous, self.ears_stable, self.ears_pending = self.ears_stable, count, None
-        log(f"buds in ears: {previous} -> {count}")
-        if previous is None or not (self.settings["auto_pause"] and self.connected):
+        log(f"buds in ears: {previous} -> {count}  ({self.ears_rssi} dBm, connected={self.connected})")
+        if previous is None:
+            return
+        # Connect the moment a bud goes in, disconnect the moment the last one comes out, instead of
+        # waiting for the AirPods/Windows to switch on their own (which takes until the lid closes).
+        if count > previous and not self.connected and self.settings["auto_connect"]:
+            log("  bud put in -> connecting")
+            self.connect()
+            return
+        if count == 0 and self.connected and self.settings["disconnect_on_remove"]:
+            log("  both buds out -> disconnecting")
+            self.disconnect()  # pause-on-disconnect takes care of the media
+            return
+        if not self.settings["auto_pause"]:
+            log("  (auto-pause is turned off)")
+            return
+        if not self.connected:
+            log("  (not acting: AirPods aren't connected to this PC)")
             return
         if count < previous and not self.paused_by_us:
             self.loop.create_task(self._pause(previous))
@@ -411,21 +547,24 @@ class TrayApp:
             self.loop.create_task(self._resume())
 
     async def _pause(self, ears_before: int) -> None:
-        if await pause_media():
+        # Include apps the AirPods already paused themselves in the last few seconds.
+        recently_playing = self.playing.playing_within(EAR_DEBOUNCE + 3)
+        paused_now = await pause_media()
+        self.paused_apps = sorted(set(recently_playing) | set(paused_now))
+        if self.paused_apps:
             self.paused_by_us, self.ears_before_pause = True, ears_before
-            log("paused media")
+            log("will resume when the bud goes back in:", self.paused_apps)
 
     async def _resume(self) -> None:
         self.paused_by_us = False
-        await resume_media()
-        log("resumed media")
+        await resume_media(self.paused_apps)
 
     # ---- pop-up ----
 
     def open_popup(self) -> None:
         if self.popup or not self.state:
             return
-        self.popup = Popup(self.root, self.state.model, self.connect, self.close_popup)
+        self.popup = Popup(self.root, self.state.model, self.connect, self.close_popup, self.disconnect)
         self.popup_shown_at = time.monotonic()
         self._refresh_popup()
 
@@ -437,6 +576,8 @@ class TrayApp:
             self.popup.show_connection("Not paired with this PC - pair in Bluetooth settings", False)
         elif self.connecting:
             self.popup.show_connection("Connecting…", False)
+        elif self.disconnecting:
+            self.popup.show_connection("Disconnecting…", False, done=True, can_disconnect=False)
         elif self.connected:
             self.popup.show_connection("Connected to this PC", False, done=True)
         elif self.connect_failed:
@@ -456,17 +597,86 @@ class TrayApp:
         self.icon.run_detached()
         log("running - look for the AirPods icon in the system tray")
         self.loop.call_later(5, show_in_taskbar_corner)  # Windows registers the icon a moment after it appears
-        watcher = self.loop.create_task(self._watch_connection())
-        async with BleakScanner(detection_callback=self.on_advert):
-            while not self.quitting:
+        self.loop.set_exception_handler(lambda loop, ctx: log("error:", ctx.get("exception") or ctx["message"]))
+        # The tray icon / Tk switch this thread to a GUI (STA) COM apartment once running. WinRT
+        # callbacks then need Windows messages pumped - which _pump_ui does, all the time (also while
+        # a scan is starting) - so tell Bleak not to refuse to start on an STA thread.
+        allow_sta()
+        jobs = [self.loop.create_task(self._pump_ui()),
+                self.loop.create_task(self._keep_running(self._watch_connection, "connection watcher")),
+                self.loop.create_task(self._keep_running(self.playing.run, "media tracker"))]
+        failures = 0
+        while not self.quitting:
+            try:
+                await self._scan()
+                failures = 0
+            except Exception as e:
+                failures += 1
+                log(f"Bluetooth scan stopped ({failures} in a row): {e!r} - restarting")
+                if failures >= MAX_SCAN_FAILURES:
+                    self.relaunch()  # a fresh process has always been able to scan, even after sleep
+                    return
+                await asyncio.sleep(2)
+        for job in jobs:
+            job.cancel()
+        self.close_popup()
+        self.icon.stop()
+
+    def relaunch(self) -> None:
+        """Start a fresh copy of the app and exit this one."""
+        log("scan keeps failing - relaunching the app")
+        mutex = globals().get("_instance_mutex")
+        if mutex:
+            ctypes.windll.kernel32.CloseHandle(mutex)  # let the new copy pass the single-instance check
+        command = [sys.executable] if getattr(sys, "frozen", False) else [sys.executable, os.path.abspath(__file__)]
+        subprocess.Popen(command, close_fds=True)
+        self.icon.stop()
+        os._exit(0)
+
+    async def _pump_ui(self) -> None:
+        """Keep the Tk window (and with it this thread's Windows messages) serviced continuously."""
+        while not self.quitting:
+            try:
                 self.root.update()
                 self._check_ears()
                 if self.popup and time.monotonic() - self.popup_shown_at > AUTO_HIDE_SECONDS:
                     self.close_popup()
-                await asyncio.sleep(0.05)
-        watcher.cancel()
-        self.close_popup()
-        self.icon.stop()
+            except Exception as e:
+                self._log_error("UI update failed", e)
+            await asyncio.sleep(0.05)
+
+    async def _keep_running(self, job, name: str) -> None:
+        """Run a background job forever: if it crashes, log why and start it again."""
+        while not self.quitting:
+            try:
+                await job()
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log(f"{name} crashed: {e!r} - restarting in 5 s")
+                await asyncio.sleep(5)
+
+    async def _scan(self) -> None:
+        """Scan for adverts. Returns (so the caller restarts the scan) if adverts stop arriving -
+        there are always other Bluetooth devices around, so total silence means Windows stopped
+        the scan (e.g. the PC slept)."""
+        self.last_advert_at = time.monotonic()
+        last_heartbeat = time.monotonic()
+        # Passive scanning: we only need the advertisement itself, never the scan response, and in
+        # testing Windows delivered ~3x more AirPods adverts this way while audio was streaming.
+        async with BleakScanner(detection_callback=lambda device, adv: self.on_advert(device, adv),
+                                scanning_mode="passive"):
+            while not self.quitting:
+                now = time.monotonic()
+                if now - self.last_advert_at > SCAN_SILENCE_RESTART:
+                    log(f"no Bluetooth adverts for {SCAN_SILENCE_RESTART} s - restarting the scan")
+                    return
+                if now - last_heartbeat > HEARTBEAT_SECONDS:
+                    log(f"alive: {self.advert_count} adverts in the last {HEARTBEAT_SECONDS // 60} min, "
+                        f"connected={self.connected}")
+                    self.advert_count, last_heartbeat = 0, now
+                await asyncio.sleep(0.25)
 
 
 if __name__ == "__main__":
