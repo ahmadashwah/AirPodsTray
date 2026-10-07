@@ -25,6 +25,19 @@ def already_running() -> bool:
     return ctypes.get_last_error() == 183  # ERROR_ALREADY_EXISTS
 
 
+QUIT_EVENT = "Local\\AirPodsTray-quit"
+
+
+def quit_event():
+    """Named event a running copy watches; `AirPodsTray.exe --quit` sets it so the app exits cleanly
+    (a force-kill skips PyInstaller's cleanup and leaves its unpacked _MEI folder in %TEMP%)."""
+    return ctypes.WinDLL("kernel32").CreateEventW(None, False, False, QUIT_EVENT)
+
+
+if __name__ == "__main__" and "--quit" in sys.argv:
+    ctypes.windll.kernel32.SetEvent(quit_event())
+    sys.exit(0)
+
 # Checked before the slow imports below so a quick double-click can't start two copies.
 if __name__ == "__main__" and already_running():
     sys.exit(0)
@@ -615,7 +628,7 @@ class TrayApp:
                 log(f"Bluetooth scan stopped ({failures} in a row): {e!r} - restarting")
                 if failures >= MAX_SCAN_FAILURES:
                     self.relaunch()  # a fresh process has always been able to scan, even after sleep
-                    return
+                    break
                 await asyncio.sleep(2)
         for job in jobs:
             job.cancel()
@@ -623,19 +636,24 @@ class TrayApp:
         self.icon.stop()
 
     def relaunch(self) -> None:
-        """Start a fresh copy of the app and exit this one."""
+        """Start a fresh copy of the app; this one then quits normally (so PyInstaller cleans up)."""
         log("scan keeps failing - relaunching the app")
         mutex = globals().get("_instance_mutex")
         if mutex:
             ctypes.windll.kernel32.CloseHandle(mutex)  # let the new copy pass the single-instance check
         command = [sys.executable] if getattr(sys, "frozen", False) else [sys.executable, os.path.abspath(__file__)]
         subprocess.Popen(command, close_fds=True)
-        self.icon.stop()
-        os._exit(0)
+        self.quitting = True
 
     async def _pump_ui(self) -> None:
-        """Keep the Tk window (and with it this thread's Windows messages) serviced continuously."""
+        """Keep the Tk window (and with it this thread's Windows messages) serviced continuously,
+        and watch for `--quit` from another process."""
+        quit_requested = quit_event()
         while not self.quitting:
+            if ctypes.windll.kernel32.WaitForSingleObject(quit_requested, 0) == 0:  # WAIT_OBJECT_0
+                log("quit requested")
+                self.quitting = True
+                break
             try:
                 self.root.update()
                 self._check_ears()

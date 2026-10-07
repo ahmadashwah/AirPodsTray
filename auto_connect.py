@@ -33,19 +33,25 @@ IOCTL_KS_PROPERTY = 0x002F0003
 A2DP_UUID = "0000110b-0000-1000-8000-00805f9b34fb"
 
 MMDEVICES_RENDER = r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render"
-PKEY_DEVICE_INTERFACE_NAME = "{b3f8fa53-0004-438e-9003-51a46e139bfc},6"
+PKEY_DEVICE_PARENT_ID = "{b3f8fa53-0004-438e-9003-51a46e139bfc},2"  # e.g. "{1}.BTHENUM\{0000110B-...}..."
 DEVICE_STATE_ACTIVE = 1  # 8 = unplugged
 
 
-def audio_endpoint_state(device_name: str) -> int | None:
-    """DeviceState of the stereo ("Headphones") output named after the Bluetooth device.
-    The hands-free endpoint is named "<device> Hands-Free", so an exact name match skips it."""
+def audio_endpoint_state(mac: int) -> int | None:
+    """DeviceState of the stereo ("Headphones") output of the Bluetooth device with this address.
+
+    Matched on the endpoint's parent device id, e.g.
+    BTHENUM\\{0000110B-...}_VID&0001004C_PID&2027\\7&...&307AD243C7A4_C00000000 - the A2DP profile
+    plus the address. (Matching the name breaks when the AirPods are renamed: Windows keeps the
+    name they had when paired.)"""
+    address = f"{mac:012x}"
     with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, MMDEVICES_RENDER) as endpoints:
         for i in range(winreg.QueryInfoKey(endpoints)[0]):
             key = winreg.EnumKey(endpoints, i)
             try:
                 with winreg.OpenKey(endpoints, key + r"\Properties") as props:
-                    if winreg.QueryValueEx(props, PKEY_DEVICE_INTERFACE_NAME)[0] != device_name:
+                    parent = winreg.QueryValueEx(props, PKEY_DEVICE_PARENT_ID)[0].lower()
+                    if A2DP_UUID not in parent or address not in parent:
                         continue
                 with winreg.OpenKey(endpoints, key) as endpoint:
                     return winreg.QueryValueEx(endpoint, "DeviceState")[0]
@@ -122,7 +128,6 @@ class PairedAirPods:
             p = path.lower()
             if A2DP_UUID in p and "vid&0001004c" in p and pid in p:
                 self.ks_path = path
-                self.name: str | None = None  # Bluetooth name, looked up on first use
                 self.mac = int(re.search(r"&([0-9a-f]{12})_c", p).group(1), 16)
                 found_pid = int(re.search(r"pid&([0-9a-f]{4})", p).group(1), 16)
                 self.model_id = ((found_pid & 0xFF) << 8) | (found_pid >> 8)  # back to BLE byte order
@@ -135,12 +140,7 @@ class PairedAirPods:
         The Bluetooth link itself (BluetoothDevice.connection_status) often stays up after the
         audio disconnects, so instead check the "Headphones" audio endpoint Windows keeps for them.
         """
-        if self.name is None:
-            device = await BluetoothDevice.from_bluetooth_address_async(self.mac)
-            if device is None:
-                return False
-            self.name = device.name
-        state = audio_endpoint_state(self.name)
+        state = audio_endpoint_state(self.mac)
         if state is None:  # no endpoint found - fall back to the Bluetooth link
             device = await BluetoothDevice.from_bluetooth_address_async(self.mac)
             return device is not None and device.connection_status == BluetoothConnectionStatus.CONNECTED
